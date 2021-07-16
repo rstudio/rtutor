@@ -327,21 +327,52 @@ evaluate_exercise <- function(
     eval(parse(text = exercise$global_setup), envir = envir)
   }
 
-  checker_feedback <- NULL
+  # Check if user code has unfilled blanks; if it does, early return
+  exercise_blanks <- exercise$options$exercise.blanks %||%
+    knitr::opts_chunk$get("exercise.blanks") %||%
+    TRUE
+  if (isTRUE(exercise_blanks)) exercise_blanks <- "_{3,}"
+
+  blank_feedback <- NULL
+  if (shiny::isTruthy(exercise_blanks)) {
+    blank_feedback <- check_blanks(exercise$code, exercise_blanks)
+  }
+
+  return_if_exercise_result <- function(res) {
+    # early return if the we've received an exercise result,
+    # but also replace the feedback with the blank feedback if any were found
+    if (!is_exercise_result(res)) {
+      return(NULL)
+    }
+
+    if (!is.null(blank_feedback$feedback)) {
+      res$feedback <- blank_feedback$feedback
+    }
+
+    rlang::return_from(rlang::caller_env(), res)
+  }
+
+
+  # Check if user code is parsable; if not, early return
+  if (
+    tolower(exercise$engine) == "r" &&
+    !isFALSE(exercise$options$exercise.parse.check)
+  ) {
+    return_if_exercise_result(check_parsable(exercise$code))
+  }
+
   # Check the code pre-evaluation, if code_check is provided
   if (nzchar(exercise$code_check)) {
-    checker_feedback <- try_checker(
-      exercise, "exercise.checker",
-      check_code = exercise$code_check,
-      envir_result = NULL,
-      evaluate_result = NULL,
-      envir_prep = duplicate_env(envir),
-      last_value = NULL,
-      engine = exercise$engine
+    # treat the blank check like a code check, if blanks were detected
+    return_if_exercise_result(blank_feedback)
+
+    return_if_exercise_result(
+      try_checker(
+        exercise,
+        check_code = exercise$code_check,
+        envir_prep = duplicate_env(envir)
+      )
     )
-    if (is_exercise_result(checker_feedback)) {
-      return(checker_feedback)
-    }
   }
 
   # Setup a temporary directory for rendering the exercise
@@ -357,64 +388,62 @@ evaluate_exercise <- function(
   rmd_results <- tryCatch(
     render_exercise(exercise, envir),
     error = function(err_render) {
+      error_feedback <- NULL
       if (nzchar(exercise$error_check)) {
         # Check the error thrown by the submitted code when there's error
         # checking: the exercise could be to throw an error!
-        checker_feedback <- try_checker(
-          exercise, "exercise.checker",
+        error_feedback <- try_checker(
+          exercise,
           check_code = exercise$error_check,
           envir_result = err_render$envir_result,
           evaluate_result = err_render$evaluate_result,
           envir_prep = err_render$envir_prep,
-          last_value = err_render,
-          engine = exercise$engine
+          last_value = err_render
         )
-        if (is_exercise_result(checker_feedback)) {
-          return(checker_feedback)
-        }
       }
-      exercise_result_error(err_render$error_message)
+      exercise_result_error(err_render$error_message, error_feedback$feedback)
     }
   )
 
-  if (is_exercise_result(rmd_results)) {
-    return(rmd_results)
-  }
+  return_if_exercise_result(rmd_results)
 
   # Run the checker post-evaluation (for checking code results)
-  if (nzchar(exercise$check)) {
+  # Don't need to do exercise checking if there are blanks
+  checker_feedback <- NULL
+  if (is.null(blank_feedback) && nzchar(exercise$check)) {
     checker_feedback <- try_checker(
-      exercise, "exercise.checker",
+      exercise,
       check_code = exercise$check,
       envir_result = rmd_results$envir_result,
       evaluate_result = rmd_results$evaluate_result,
       envir_prep = rmd_results$envir_prep,
-      last_value = rmd_results$last_value,
-      engine = exercise$engine
+      last_value = rmd_results$last_value
     )
   }
 
   # Return checker feedback (if any) with the exercise results
   exercise_result(
-    feedback = checker_feedback$feedback,
+    feedback = checker_feedback$feedback %||% blank_feedback$feedback,
     html_output = rmd_results$html_output
   )
 }
 
 
-try_checker <- function(exercise, name, check_code, envir_result,
-                        evaluate_result, envir_prep, last_value,
-                        engine) {
+try_checker <- function(
+  exercise, name = "exercise.checker", check_code = NULL, envir_result = NULL,
+  evaluate_result = NULL, envir_prep, last_value = NULL,
+  engine = exercise$engine
+) {
   checker_func <- tryCatch(
     get_checker_func(exercise, name, envir_prep),
     error = function(e) {
-      message("Error occurred while retrieving 'exercise.checker'. Error:\n", e)
+      message("Error occurred while retrieving '", name, "'. Error:\n", e)
       exercise_result_error(e$message)
     }
   )
   # If retrieving checker_func fails, return an error result
   if (is_error_result(checker_func)) {
-    return(checker_func)
+    rlang::return_from(rlang::caller_env(), checker_func)
   }
   checker_args <- names(formals(checker_func))
   args <- list(
@@ -436,7 +465,7 @@ try_checker <- function(exercise, name, check_code, envir_result,
       name, paste(missing_args, collapse = "', '")
     )
     message(msg)
-    return(exercise_result_error(msg))
+    rlang::return_from(rlang::caller_env(), exercise_result_error(msg))
   }
 
   # Call the check function
@@ -450,7 +479,7 @@ try_checker <- function(exercise, name, check_code, envir_result,
   )
   # If checker code fails, return an error result
   if (is_error_result(feedback)) {
-    return(feedback)
+    rlang::return_from(rlang::caller_env(), feedback)
   }
   # If checker doesn't return anything, there's no exercise result to return
   if (length(feedback)) {
@@ -692,21 +721,68 @@ exercise_code_chunks <- function(chunks) {
   }, character(1))
 }
 
+check_blanks <- function(user_code, blank_regex) {
+  blank_regex <- paste(blank_regex, collapse = "|")
+
+  blanks <- str_match_all(user_code, blank_regex)
+
+  if (!length(blanks)) {
+    return(NULL)
+  }
+
+  msg <- paste(
+    i18n_span(
+      "text.exercisecontainsblank", opts = list(count = length(blanks))
+    ),
+    i18n_span(
+      "text.pleasereplaceblank",
+      opts = list(
+        count = length(blanks),
+        blank = i18n_combine_words(unique(blanks), before = "<code>", after = "</code>"),
+        interpolation = list(escapeValue = FALSE)
+      )
+    )
+  )
+
+  exercise_result(
+    list(message = HTML(msg), correct = FALSE, location = "prepend", type = "error")
+  )
+}
+
+check_parsable <- function(user_code) {
+  error <- rlang::catch_cnd(parse(text = user_code), "error")
+  if (is.null(error)) {
+    return(NULL)
+  }
+
+  exercise_result(
+    list(
+      message = HTML(i18n_span("text.unparsable")),
+      correct = FALSE,
+      location = "append",
+      type = "error"
+    ),
+    html_output = error_message_html(error$message),
+    error_message = error$message
+  )
+}
+
 exercise_result_timeout <- function() {
   exercise_result_error(
     "Error: Your code ran longer than the permitted timelimit for this exercise.",
-    timeout_exceeded = TRUE
+    timeout_exceeded = TRUE,
+    style = "alert"
   )
 }
 
 # @param timeout_exceeded represents whether or not the error was triggered
 #   because the exercise exceeded the timeout. Use NA if unknown
-exercise_result_error <- function(error_message, feedback = NULL, timeout_exceeded = NA) {
+exercise_result_error <- function(error_message, feedback = NULL, timeout_exceeded = NA, style = "code") {
   exercise_result(
     feedback = feedback,
     timeout_exceeded = timeout_exceeded,
     error_message = error_message,
-    html_output = error_message_html(error_message)
+    html_output = error_message_html(error_message, style = style)
   )
 }
 

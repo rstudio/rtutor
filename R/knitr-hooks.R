@@ -340,7 +340,7 @@ install_knitr_hooks <- function() {
                                code_check = code_check_chunk,
                                error_check = error_check_chunk,
                                check = check_chunk,
-                               solution  = solution,
+                               solution = solution,
                                options = options,
                                engine = options$engine)
 
